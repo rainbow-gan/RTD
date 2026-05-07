@@ -529,7 +529,8 @@
                     <div class="input-group"><!--实验日期-->
                         <label for="experiment-start-date">实验起始日期：</label>
                         <input type="datetime-local" id="experiment-start-date" value="2024-01-15T00:00:01">
-                        <label>——</label>
+                    </div>
+                    <div class="input-group">
                         <label for="experiment-end-date">实验结束日期：</label>
                         <input type="datetime-local" id="experiment-end-date" value="2024-01-15T23:59:59">
                     </div>
@@ -559,9 +560,9 @@
                 
                 <div id="import-tab" class="tab-content">
                     <div class="input-group">
-                        <label for="file-upload">选择数据文件（CSV或TXT）：</label>
-                        <input type="file" id="file-upload" accept=".csv,.txt" style="padding: 8px; border: 2px dashed #3498db;">
-                        <div class="data-format-example">支持CSV和纯文本文件，请确保数据格式正确</div>
+                        <label for="file-upload">选择数据文件（CSV / TXT / xlsx）：</label>
+                        <input type="file" id="file-upload" accept=".csv,.txt,.xlsx,.xls" style="padding: 8px; border: 2px dashed #3498db;">
+                        <div class="data-format-example">xlsx 将读取表「通道数据」；CSV/TXT 为逗号分隔文本</div>
                     </div>
                 </div>
                 
@@ -641,10 +642,11 @@
                 
                 <div class="input-group">
                     <label>报告预览（Word 版式）：</label>
-                    <div class="report-preview" id="report-preview">
-                        <!-- 报告预览内容将由JavaScript动态生成 -->
-                    </div>
+                </div> 
+                <div class="report-preview" id="report-preview">
+                    <!-- 报告预览内容将由JavaScript动态生成 -->
                 </div>
+                
                 
                 <div class="button-group" style="margin-top: 20px;">
                     <button class="btn btn-primary" onclick="updateReport()">
@@ -678,10 +680,11 @@
 
     <!-- 引入Chart.js库用于图表绘制 -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
     <script>
         // 全局变量
         let experimentData = [];
+        let channelDataImportSummary = null; // { dataRowCount, deviceCount, deviceNames }
         let chart = null;
         let reportData = {
             title: '',
@@ -713,6 +716,17 @@
             document.getElementById(tabId).classList.add('active');
             event.target.classList.add('active');
         }
+        //查询数据输入方式
+        function getActiveDataInputTab() {
+            const tabIds = ['manual-tab', 'import-tab', 'sample-tab'];
+            for (const id of tabIds) {
+                const el = document.getElementById(id);
+                if (el && el.classList.contains('active')) {
+                    return id;
+                }
+            }
+            return 'manual-tab';
+        }
         
         // 加载示例数据
         function loadSampleData() {
@@ -743,54 +757,144 @@
             showMessage('已加载示例数据', 'success');
         }
         
+        //处理异常数据
+        function coerceCellValue(v) {
+            if (v === '' || v === undefined || v === null) return '';
+            if (typeof v === 'number' && !isNaN(v)) return v;
+            const s = String(v).trim();
+            if (s === '') return '';
+            const n = parseFloat(s);
+            if (!isNaN(n) && isFinite(n) && /^-?\d/.test(s)) return n;
+            return v;
+        }
+        
+        //处理xlxs文件
+        function parseChannelDataSheetFromWorkbook(workbook) {
+            if (typeof XLSX === 'undefined') {
+                throw new Error('未加载 xlsx 解析库，请检查网络后刷新页面');
+            }
+            const TARGET = '通道数据';
+            const sheetName = workbook.SheetNames.find(n => String(n).trim() === TARGET);
+            if (!sheetName) {
+                throw new Error('未找到名为「' + TARGET + '」的工作表。当前：' + workbook.SheetNames.join('、'));
+            }
+            const sheet = workbook.Sheets[sheetName];
+            const matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+            if (!matrix || matrix.length === 0) {
+                throw new Error('「通道数据」工作表为空');
+            }
+            const headerRow = matrix[0].map(c => String(c).trim());
+            const deviceNames = headerRow.slice(2).filter(h => h !== '');
+            if (headerRow.length < 3 || deviceNames.length === 0) {
+                throw new Error('表头至少三列：序号、时间、至少一列检测设备名称');
+            }
+            const seqKey = headerRow[0] || '序号';
+            const timeKey = headerRow[1] || '时间';
+            const rows = [];
+            for (let i = 1; i < matrix.length; i++) {
+                const r = matrix[i];
+                if (!r) continue;
+                const cells = r.slice();
+                while (cells.length < headerRow.length) cells.push('');
+                if (!cells.some((c, idx) => idx < headerRow.length && String(c).trim() !== '')) continue;
+                const rowObj = {};
+                rowObj[seqKey] = coerceCellValue(cells[0]);
+                rowObj[timeKey] = coerceCellValue(cells[1]);
+                for (let j = 2; j < headerRow.length; j++) {
+                    const colName = headerRow[j];
+                    if (!colName) continue;
+                    rowObj[colName] = coerceCellValue(cells[j]);
+                }
+                rows.push(rowObj);
+            }
+            if (rows.length === 0) {
+                throw new Error('「通道数据」中未解析到有效数据行');
+            }
+            return {
+                dataRowCount: rows.length,
+                deviceCount: deviceNames.length,
+                deviceNames: deviceNames.slice(),
+                headerRow: headerRow.slice(),
+                rows
+            };
+        }
+        
+        /** 从「实验标题」「实验数据」文本框解析 CSV 到 experimentData */
+        function parseTextareaCsvIntoExperimentData() {
+            const data_input = document.getElementById('data-input').value.trim();
+            const experimentTitle = document.getElementById('experiment-title-data').value.trim();
+            const title_dataText = experimentTitle.replace(/\t/g, ',');
+            const dataText = data_input.replace(/\t/g, ',');
+            if (!experimentTitle) {
+                throw new Error('请输入实验标题');
+            }
+            if (!dataText) {
+                throw new Error('请输入实验数据');
+            }
+            const lines = dataText.split('\n').filter(line => line.trim());
+            const lines_title = title_dataText.split('\n').filter(line => line.trim());
+            if (lines.length < 1) {
+                throw new Error('数据格式错误，请确保包含标题行和数据行');
+            }
+            const headers = lines_title[0].split(',').map(h => h.trim());
+            experimentData = [];
+            for (let i = 0; i < lines.length; i++) {
+                const values = lines[i].split(',').map(v => parseFloat(v.trim()));
+                if (values.length === headers.length) {
+                    const row = {};
+                    headers.forEach((header, index) => {
+                        row[header] = values[index];
+                    });
+                    experimentData.push(row);
+                }
+            }
+            if (experimentData.length === 0) {
+                throw new Error('未找到有效数据，请检查数据格式');
+            }
+        }
+        
+        function finalizeParsedExperimentData(successMsg) {
+            updateDataTable();
+            calculateStatistics();
+            drawChart();
+            saveToLocalStorage();
+            showMessage(successMsg, 'success');
+        }
+        
         // 处理数据
         function processData() {
             const loading = document.getElementById('loading');
             loading.classList.add('active');
-            
+            const input_data_format = getActiveDataInputTab();
             setTimeout(() => {
                 try {
-                    const data_input = document.getElementById('data-input').value.trim();//value is used to delete the spaces in the beginning and end.
-                    const experimentTitle = document.getElementById('experiment-title-data').value.trim();
-                    const title_dataText = experimentTitle.replace(/\t/g, ',');     // Tab 转 CSV 分隔符
-                    const dataText = data_input.replace(/\t/g, ',');
-                    if (!experimentTitle) {
-                        throw new Error('请输入实验标题'); // 如果没有输入显示“请输入实验标题”
-                    }
-                    if (!dataText) {
-                        throw new Error('请输入实验数据'); // 如果没有输入显示“请输入实验数据”
-                    }
-                    const lines = dataText.split('\n').filter(line => line.trim()); //split is used to split the data into lines.
-                    const lines_title = title_dataText.split('\n').filter(lines_title => lines_title.trim());
-                    //filter 函数用以保留最后为真值的函数
-                    if (lines.length < 1) {
-                        throw new Error('数据格式错误，请确保包含标题行和数据行'); // 如果数据格式错误显示“数据格式错误，请确保包含标题行和数据行”
-                    }
-                    
-                    const headers = lines_title[0].split(',').map(h => h.trim());
-                    experimentData = [];
-                    
-                    for (let i = 0; i < lines.length; i++) {
-                        const values = lines[i].split(',').map(v => parseFloat(v.trim()));//parseFloat 将函数转换为浮点数
-                        if (values.length === headers.length) {
-                            const row = {};
-                            headers.forEach((header, index) => {
-                                row[header] = values[index];
-                            });
-                            experimentData.push(row);
+                    switch (input_data_format) {
+                        case 'manual-tab':
+                        case 'sample-tab':
+                            channelDataImportSummary = null;
+                            parseTextareaCsvIntoExperimentData();
+                            finalizeParsedExperimentData(`成功处理 ${experimentData.length} 行数据`);
+                            break;
+                        case 'import-tab': {
+                            const di = document.getElementById('data-input').value.trim();
+                            if (!di || di.startsWith('(已从 xlsx')) {
+                                if (experimentData.length > 0 && channelDataImportSummary && di.startsWith('(已从 xlsx')) {
+                                    finalizeParsedExperimentData(
+                                        `「通道数据」共 ${channelDataImportSummary.dataRowCount} 行，` +
+                                        `${channelDataImportSummary.deviceCount} 个检测设备`
+                                    );
+                                    break;
+                                }
+                                throw new Error('请先在上方选择数据文件（xlsx / csv / txt）');
+                            }
+                            channelDataImportSummary = null;
+                            parseTextareaCsvIntoExperimentData();
+                            finalizeParsedExperimentData(`成功处理 ${experimentData.length} 行数据`);
+                            break;
                         }
+                        default:
+                            break;
                     }
-                    
-                    if (experimentData.length === 0) {
-                        throw new Error('未找到有效数据，请检查数据格式');
-                    }
-                    
-                    updateDataTable();
-                    calculateStatistics();
-                    drawChart();
-                    saveToLocalStorage();
-                    
-                    showMessage(`成功处理 ${experimentData.length} 行数据`, 'success');
                 } catch (error) {
                     showMessage('数据处理错误: ' + error.message, 'error');
                 } finally {
@@ -802,18 +906,33 @@
         // 更新数据表格
         function updateDataTable() {
             const tbody = document.getElementById('data-table-body');
-            tbody.innerHTML = '';
+            tbody.innerHTML = '';//
             
             // 更新表头
-            const headers = Object.keys(experimentData[0] || {});
+            const allHeaders = Object.keys(experimentData[0] || {});
+            const hiddenCols = new Set(['序号', '时间']);
+            const displayHeaders = allHeaders.filter(h => !hiddenCols.has(String(h).trim()));
             const thead = document.querySelector('#data-table thead tr');
-            thead.innerHTML = '<th>#</th>' + headers.map(h => `<th>${h}</th>`).join('') + '<th>操作</th>';
+            thead.innerHTML = '<th>#</th>' + displayHeaders.map(h => `<th>${escapeHtml(h)}</th>`).join('') + '<th>操作</th>';
+            
+            if (channelDataImportSummary && experimentData.length > 0) {
+                const colspan = displayHeaders.length + 2;
+                const names = channelDataImportSummary.deviceNames.map(n => escapeHtml(n)).join('、');
+                const tr = document.createElement('tr');
+                tr.className = 'channel-import-summary-row';
+                tr.innerHTML =
+                    '<td colspan="' + colspan  + '" style="background:#e8f4fc;font-weight:600;padding:10px;">' +
+                    '「通道数据」：共 <strong>' + channelDataImportSummary.dataRowCount + '</strong> 行；' +
+                    '检测设备 <strong>' + channelDataImportSummary.deviceCount + '</strong> 个：' + names +
+                    '</td>';
+                tbody.appendChild(tr);
+            }
             
             experimentData.forEach((row, index) => {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td>${index + 1}</td>
-                    ${headers.map(header => `<td>${formatNumber(row[header])}</td>`).join('')}
+                    ${displayHeaders.map(header => `<td>${formatNumber(row[header])}</td>`).join('')}
                     <td>
                         <button class="btn btn-danger" style="padding: 5px 10px; font-size: 0.9em;" onclick="deleteRow(${index})">删除</button>
                         <button class="btn btn-primary" style="padding: 5px 10px; font-size: 0.9em; margin-left: 5px;" onclick="editRow(${index})">编辑</button>
@@ -1283,6 +1402,7 @@ ${bodyInnerHtml}
         function clearData() {
             if (confirm('确定要清除所有数据吗？')) {
                 experimentData = [];
+                channelDataImportSummary = null;
                 document.getElementById('data-input').value = '';
                 document.getElementById('data-table-body').innerHTML = '';
                 document.getElementById('stats-container').innerHTML = '';
@@ -1301,24 +1421,66 @@ ${bodyInnerHtml}
             }
         }
         
-        // 文件导入处理
+        /** xlsx「通道数据」解析结果写入全局并刷新图表/表格 */
+        function applyChannelDataXlsxResult(result, fileName) {
+            experimentData = result.rows;
+            channelDataImportSummary = {
+                dataRowCount: result.dataRowCount,
+                deviceCount: result.deviceCount,
+                deviceNames: result.deviceNames
+            };
+            document.getElementById('experiment-title-data').value = result.headerRow.join(',');
+            document.getElementById('data-input').value = '(已从 xlsx「通道数据」导入)';
+            updateDataTable();
+            calculateStatistics();
+            drawChart();
+            saveToLocalStorage();
+            showMessage(
+                `已导入「${fileName}」：通道数据 ${result.dataRowCount} 行，${result.deviceCount} 个检测设备`,
+                'success'
+            );
+        }
+        
+        // 文件导入：xlsx/xls 用 ArrayBuffer + SheetJS；csv/txt 为文本后走 processData
         document.getElementById('file-upload').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
+            const lower = file.name.toLowerCase();
+            
+            if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) {
+                const reader = new FileReader();
+                reader.onload = function (event) {
+                    try {
+                        if (typeof XLSX === 'undefined') {
+                            throw new Error('未加载 xlsx 解析库，请刷新页面重试');
+                        }
+                        const workbook = XLSX.read(event.target.result, { type: 'array' });
+                        const result = parseChannelDataSheetFromWorkbook(workbook);
+                        applyChannelDataXlsxResult(result, file.name);
+                    } catch (err) {
+                        showMessage('文件导入失败: ' + err.message, 'error');
+                    }
+                };
+                reader.onerror = function () {
+                    showMessage('文件读取失败', 'error');
+                };
+                reader.readAsArrayBuffer(file);
+                e.target.value = '';
+                return;
+            }
             
             const reader = new FileReader();
-            reader.onload = function(event) {
+            reader.onload = function (event) {
                 try {
-                    const content = event.target.result;
-                    document.getElementById('data-input').value = content;
+                    document.getElementById('data-input').value = event.target.result;
+                    channelDataImportSummary = null;
                     processData();
-                    showMessage(`已导入文件: ${file.name}`, 'success');
                 } catch (error) {
                     showMessage('文件导入失败: ' + error.message, 'error');
                 }
             };
-            
-            reader.readAsText(file);
+            reader.readAsText(file, 'UTF-8');
+            e.target.value = '';
         });
         
         // 格式化数字显示
