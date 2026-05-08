@@ -903,15 +903,16 @@
             }, 800);
         }
         
-        // 更新数据表格
+        // 更新数据表格（不展示「序号」「时间」列，仅展示检测设备等业务列；数据中仍保留这两列）
         function updateDataTable() {
             const tbody = document.getElementById('data-table-body');
-            tbody.innerHTML = '';//
+            tbody.innerHTML = '';//清空表格
             
-            // 更新表头
             const allHeaders = Object.keys(experimentData[0] || {});
             const hiddenCols = new Set(['序号', '时间']);
             const displayHeaders = allHeaders.filter(h => !hiddenCols.has(String(h).trim()));
+            
+            // 更新表头
             const thead = document.querySelector('#data-table thead tr');
             thead.innerHTML = '<th>#</th>' + displayHeaders.map(h => `<th>${escapeHtml(h)}</th>`).join('') + '<th>操作</th>';
             
@@ -947,10 +948,12 @@
             if (experimentData.length === 0) return;
             
             const headers = Object.keys(experimentData[0]);
+            const hiddenHeaders_calculateStatistics = new Set(['序号','时间']);
+            const calculateStatisticsHeaders = headers.filter(i=>!hiddenHeaders_calculateStatistics.has(String(i).trim()));
             const statsContainer = document.getElementById('stats-container');
             statsContainer.innerHTML = '';
             
-            headers.forEach(header => {
+            calculateStatisticsHeaders.forEach(header => {
                 const values = experimentData.map(row => row[header]).filter(v => !isNaN(v));
                 if (values.length > 0) {
                     const sum = values.reduce((a, b) => a + b, 0);
@@ -991,8 +994,10 @@
             
             const ctx = document.getElementById('data-chart').getContext('2d');
             const headers = Object.keys(experimentData[0]);
-            const xHeader = headers[0];
-            const yHeaders = headers.slice(1);//
+            const hiddenHeaders_drawChart = new Set(['序号']);
+            const drawChartHeaders = headers.filter(j=>!hiddenHeaders_drawChart.has(String(j).trim()));
+            const xHeader = drawChartHeaders[0];
+            const yHeaders = drawChartHeaders.slice(1);//
             
             if (chart) { //如果图表存在，就销毁图表
                 chart.destroy();
